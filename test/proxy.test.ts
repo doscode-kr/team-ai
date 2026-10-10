@@ -359,3 +359,33 @@ test('an error body that is cut mid-read still releases the account slot', async
     assert.equal(pool.inFlightProxied, 0);
   } finally { proxy.closeAllConnections(); upstream.closeAllConnections(); await Promise.all([new Promise<void>((r) => proxy.close(() => r())), new Promise<void>((r) => upstream.close(() => r()))]); }
 });
+
+test('a 403 from every account refuses the request without benching the fleet; a 403 another account serves is benched', async () => {
+  const refuseAll = { value: true };
+  const upstream = createServer(async (req, res) => {
+    const account = String(req.headers['chatgpt-account-id']);
+    req.resume(); await new Promise<void>((resolve) => req.once('end', resolve));
+    if (account === 'a' || refuseAll.value) { res.writeHead(403, { 'content-type': 'application/json' }); res.end('{"detail":"forbidden"}'); }
+    else { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.end('data: {"type":"response.completed"}\n\n'); }
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve)); const address = upstream.address(); assert(address && typeof address !== 'string');
+  const provider: Provider = { ...codexProvider, upstreamBase: `http://127.0.0.1:${address.port}`, refresh: async (c) => c,
+    buildHeaders(incoming, account) { const result = new Headers(incoming); result.delete('authorization'); result.set('chatgpt-account-id', account.id); return result; } };
+  const stored = (id: string, priority: number): StoredAccount => ({ id, provider: 'codex', label: id, enabled: true, priority, credentialId: id, createdAt: '' });
+  const credential = (id: string): OAuthCredential => ({ accessToken: `secret-${id}`, refreshToken: null, expiresAt: null, accountId: id });
+  const pool = new AccountPool(provider, [stored('a', 1), stored('b', 2)], { a: credential('a'), b: credential('b') }, { version: 1, accounts: {} });
+  const events: string[] = [];
+  const proxy = createProxy(pool, 'local-secret', (event) => { if (event) events.push(event); }); await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve)); const proxyAddress = proxy.address(); assert(proxyAddress && typeof proxyAddress !== 'string');
+  const call = () => fetch(`http://127.0.0.1:${proxyAddress.port}/v1/responses`, { method: 'POST', headers: { authorization: 'Bearer local-secret', 'content-type': 'application/json' }, body: '{}' });
+  const cooled = (id: string) => Boolean(pool.accounts.find((x) => x.id === id)?.cooldownUntil);
+  try {
+    const refused = await call();
+    assert.equal(refused.status, 403); assert.match(await refused.text(), /forbidden/);
+    assert.equal(cooled('a'), false); assert.equal(cooled('b'), false);
+    assert(events.some((e) => /body: \{"detail":"forbidden"\}/.test(e)));
+    refuseAll.value = false;
+    const served = await call();
+    assert.equal(served.status, 200); await served.text();
+    assert.equal(cooled('a'), true); assert.equal(cooled('b'), false);
+  } finally { proxy.close(); upstream.close(); }
+});

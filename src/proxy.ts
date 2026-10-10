@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Socket } from 'node:net';
 import { AccountPool } from './account-pool.js';
-import type { Provider } from './types.js';
+import type { Provider, RuntimeAccount } from './types.js';
 
 // Upper bound on waiting for upstream response headers only. Never applies to the body.
 const HEADER_TIMEOUT_MS = 300_000;
@@ -61,6 +61,12 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
   const wantsFable = pool.provider.usesFableBudget?.(path, body) ?? false;
   let lastFailure: { response: Response; body: string; transient: boolean } | null = null;
   const transientAccounts = new Set<string>();
+  // A 403 benches an account for 30 minutes, but the same 403 from every
+  // account means the request is refused, not the accounts: one such request
+  // swept the whole Codex fleet into a simultaneous 30-minute cooldown at 16-19%
+  // weekly usage (2026-10-09/10, three times). Hold the bench until another
+  // account proves it can serve this request.
+  const forbidden: Array<{ account: RuntimeAccount; ms: number }> = [];
   let retryRounds = 0;
   let retryWaitMs = 0;
   let nextRetryAt = 0;
@@ -165,7 +171,19 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
         nextRetryAt = Math.max(nextRetryAt, Date.now() + decision.retryAfterMs);
         continue;
       }
-      if (decision.kind === 'quota' || decision.kind === 'forbidden') {
+      onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} ${response.status} ${decision.kind} body: ${errorBody.replace(/\s+/g, ' ').slice(0, 300)}`);
+      if (decision.kind === 'forbidden') {
+        excluded.add(account.id);
+        if (forbidden.length) {
+          copyHeaders(response, res); res.writeHead(response.status); res.end(errorBody);
+          onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} ${response.status} on a second account; request refused, no cooldown`);
+          return;
+        }
+        forbidden.push({ account, ms: decision.retryAfterMs });
+        onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} ${response.status} forbidden; failover (bench pending)`);
+        continue;
+      }
+      if (decision.kind === 'quota') {
         pool.cooldown(account, decision.retryAfterMs, decision.kind); excluded.add(account.id); onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} ${response.status} ${decision.kind}; failover`);
         // A spent account after a transient one must not end the request: the
         // transient account still has its retry rounds, and the decision block
@@ -177,6 +195,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
       }
       copyHeaders(response, res); res.writeHead(response.status); res.end(errorBody); onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} ${response.status}`); return;
     }
+    for (const item of forbidden) { pool.cooldown(item.account, item.ms, 'forbidden'); onChange(`${pool.provider.label} ${item.account.label} benched: 403 while ${account.label} served the same request`); }
     pool.commitProbe(path, incomingHeaders(req), body, response.headers);
     copyHeaders(response, res); res.writeHead(response.status);
     // A stream that breaks after the 200 was written used to be logged as a
