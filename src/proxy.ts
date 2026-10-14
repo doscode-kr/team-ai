@@ -19,6 +19,13 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
   for await (const chunk of req) { const value = Buffer.from(chunk); size += value.length; if (size > MAX_BODY) throw Object.assign(new Error('Request too large'), { status: 413 }); parts.push(value); }
   return Buffer.concat(parts);
 }
+// "network error" alone hid whether a token refresh or the upstream call
+// failed, and why: fetch wraps the socket error, so the code lives on cause.
+export function describeError(error: unknown): string {
+  const err = error as { name?: string; message?: string; cause?: { code?: string; message?: string } } | null;
+  const code = err?.cause?.code; const detail = err?.cause?.message || err?.message || String(error);
+  return code ? `${code} ${detail}` : detail;
+}
 function incomingHeaders(req: IncomingMessage): Headers { const headers = new Headers(); for (const [k, v] of Object.entries(req.headers)) { if (Array.isArray(v)) v.forEach((x) => headers.append(k, x)); else if (v !== undefined) headers.set(k, v); } return headers; }
 // Which session a request belongs to, for account affinity. The provider reads
 // the client's own id (Claude Code's x-claude-code-session-id, Codex's
@@ -104,8 +111,10 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
       return json(res, 429, { error: shortfall.message }, headers);
     }
     let response: Response;
+    let phase = 'token refresh';
     try {
       await pool.refresh(account);
+      phase = 'upstream';
       const headers = pool.provider.buildHeaders(incomingHeaders(req), account);
       const sendBody = pool.provider.rewriteBody(body, account);
       headers.set('content-length', String(sendBody.length));
@@ -122,9 +131,15 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, body: Buffer,
         response = await fetch(`${pool.provider.upstreamBase}${path}`, { method: req.method, headers, body: ['GET', 'HEAD'].includes(req.method || '') ? undefined : new Uint8Array(sendBody), signal: headerGuard.signal });
       } finally { clearTimeout(headerTimer); }
     } catch (error) {
-      lastFailure = { response: new Response(null, { status: 502 }), body: JSON.stringify({ error: 'Upstream connection failed' }), transient: false };
-      pool.release(account); pool.cooldown(account, 2_000, 'network'); excluded.add(account.id); onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error; failover`);
-      if (excluded.size >= pool.accounts.length) throw error;
+      // A dropped connection is the network, not the account: on 2026-10-14
+      // ETIMEDOUT bursts hit every account within seconds, the fleet was
+      // exhausted in one pass and Claude Code got a bare 502. Mark it transient
+      // so the relay's bounded retry rounds (≤2, ≤20s) get another try first.
+      lastFailure = { response: new Response(null, { status: 502 }), body: JSON.stringify({ error: 'Upstream connection failed' }), transient: true };
+      // The retry must outwait the 2s network cooldown, or a small fleet finds
+      // every account still cooling and gives up on the first round.
+      transientAccounts.add(account.id); nextRetryAt = Math.max(nextRetryAt, Date.now() + 2_100);
+      pool.release(account); pool.cooldown(account, 2_000, 'network'); excluded.add(account.id); onChange(`${pool.provider.label} ${req.method} ${path} → ${account.label} network error (${phase}: ${describeError(error)}); failover`);
       continue;
     }
     pool.updateQuota(account, response.headers);
