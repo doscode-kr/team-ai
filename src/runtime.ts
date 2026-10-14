@@ -140,9 +140,17 @@ export async function runServer(): Promise<void> {
     const drained = Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
     await Promise.race([drained, new Promise<void>((resolve) => setTimeout(resolve, DRAIN_MS).unref())]);
     servers.forEach((server) => server.closeAllConnections());
-    await drained; await saving; await persistNow(); await rm(serverPath, { force: true }); process.exit(0);
+    await drained; await saving; await persistNow(); await releaseServerFile(serverPath); process.exit(0);
   };
   process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
 }
 
+// Remove server.json only while it still names this process. A restart lets the
+// replacement bind and write its own server.json while this one is still
+// draining; deleting unconditionally erased the live server's record, so every
+// launcher took the relay for stopped and died on EADDRINUSE (2026-10-15).
+async function releaseServerFile(serverPath: string): Promise<void> {
+  try { const value = JSON.parse(await readFile(serverPath, 'utf8')) as { pid?: number }; if (value.pid !== process.pid) return; } catch { return; }
+  await rm(serverPath, { force: true });
+}
 export async function runningPid(): Promise<number | null> { try { const value = JSON.parse(await readFile(paths().server, 'utf8')) as { pid?: number }; if (!value.pid) return null; process.kill(value.pid, 0); return value.pid; } catch { return null; } }
