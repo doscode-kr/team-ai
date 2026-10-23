@@ -4,6 +4,12 @@ import type { OAuthCredential, PersistedState, ProbeTemplate, Provider, QuotaSna
 // on what one request has already tried.
 const NO_EXCLUSIONS = new Set<string>();
 
+// fetch rejects with a TypeError when no response arrived at all (DNS, connect,
+// reset) and with a TimeoutError when its signal timed out; an HTTP refusal
+// is an ordinary Error thrown by the provider after reading the status.
+function isUnreachable(error: unknown): boolean { const e = error as { name?: string } | null; return error instanceof TypeError || e?.name === 'TimeoutError' || e?.name === 'AbortError'; }
+function networkCause(error: unknown): string { const e = error as { message?: string; cause?: { code?: string } } | null; return e?.cause?.code || e?.message || String(error); }
+
 export class AccountPool {
   readonly accounts: RuntimeAccount[];
   private affinity = new Map<string, string>();
@@ -364,14 +370,14 @@ export class AccountPool {
   // Sequential on purpose: after a long downtime the whole fleet can be due at
   // once, and firing every refresh together would burst the token endpoint into
   // a rate limit that errors accounts that were merely idle. One at a time.
-  async refreshLapsed(): Promise<{ healed: number; failed: number }> {
-    if (this.sweepInFlight) return { healed: 0, failed: 0 };
+  async refreshLapsed(): Promise<{ healed: number; failed: number; unreachable: number }> {
+    if (this.sweepInFlight) return { healed: 0, failed: 0, unreachable: 0 };
     this.sweepInFlight = true;
     try {
       const now = Date.now();
       const due = this.accounts.filter((a) => a.credential.refreshToken
         && (a.error !== null || a.credential.expiresAt === null || a.credential.expiresAt < now + 5 * 60_000));
-      let healed = 0; let failed = 0;
+      let healed = 0; let failed = 0; let unreachable = 0;
       for (const account of due) {
         // Force when the account errored or its expiry is unknown: refresh()'s
         // own gate skips a token that still looks valid, but an errored account
@@ -384,9 +390,17 @@ export class AccountPool {
         // token cannot be renewed cannot serve, so it is benched here until a
         // later sweep — or a re-login adopted by adoptCredentials — heals it.
         try { await this.refresh(account, account.error !== null || account.credential.expiresAt === null); healed++; }
-        catch (error) { failed++; account.error = `token refresh failed: ${(error as Error).message}`; }
+        //
+        // A refusal and an unreachable token endpoint are told apart: both bench
+        // the account, but only a refusal needs a re-login. On 2026-10-22 a
+        // network outage was reported as "re-login needed", the user re-logged
+        // for nothing, and the next sweep would have healed it on its own.
+        catch (error) {
+          if (isUnreachable(error)) { unreachable++; account.error = `token refresh unreachable (${networkCause(error)}); retrying`; }
+          else { failed++; account.error = `token refresh failed: ${(error as Error).message}`; }
+        }
       }
-      return { healed, failed };
+      return { healed, failed, unreachable };
     } finally {
       this.sweepInFlight = false;
     }

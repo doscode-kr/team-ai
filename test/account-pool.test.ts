@@ -219,7 +219,7 @@ test('refreshLapsed refreshes errored and expiring accounts, skips healthy ones'
     { 'codex:err': cred('err', now + 60 * 60_000), 'codex:soon': cred('soon', now + 60_000), 'codex:healthy': cred('healthy', now + 60 * 60_000), 'codex:notoken': { accessToken: 't', refreshToken: null, expiresAt: now + 60_000, accountId: 'notoken' } }, state);
   pool.accounts.find((a) => a.id === 'err')!.error = 'boom';
   const count = await pool.refreshLapsed();
-  assert.deepEqual(count, { healed: 2, failed: 0 });
+  assert.deepEqual(count, { healed: 2, failed: 0, unreachable: 0 });
   assert.deepEqual(refreshed.sort(), ['err', 'soon']); // healthy skipped; notoken has no refresh token
 });
 
@@ -405,7 +405,7 @@ test('the lapsed-token sweep reports only real renewals and benches a token that
   const flaky: Provider = { ...provider, refresh: async (c) => { if (c.accountId === 'b') throw new Error('invalid_grant'); return { ...c, accessToken: 'renewed', expiresAt: Date.now() + 3_600_000 }; } };
   const expired = (id: string) => ({ ...credential(id), expiresAt: Date.now() - 1 });
   const pool = new AccountPool(flaky, [account('a'), account('b')], { 'codex:a': expired('a'), 'codex:b': expired('b') }, state);
-  assert.deepEqual(await pool.refreshLapsed(), { healed: 1, failed: 1 });
+  assert.deepEqual(await pool.refreshLapsed(), { healed: 1, failed: 1, unreachable: 0 });
   const a = pool.accounts.find((x) => x.id === 'a')!; const b = pool.accounts.find((x) => x.id === 'b')!;
   assert.equal(a.credential.accessToken, 'renewed'); assert.equal(a.error, null);
   assert.match(b.error!, /token refresh failed: invalid_grant/);
@@ -482,4 +482,14 @@ test('measuredAt survives a restart via exported state', () => {
   const output: PersistedState = { version: 1, accounts: {} }; pool.exportState(output);
   const restored = new AccountPool(provider, [account('a')], { 'codex:a': credential('a') }, output);
   assert.equal(restored.accounts[0]!.measuredAt, 1234);
+});
+
+test('a token endpoint the network cannot reach is retried, not reported as needing a re-login', async () => {
+  // fetch's own shape for "no response at all": a TypeError with the socket error on cause.
+  const offline: Provider = { ...provider, refresh: async () => { throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ETIMEDOUT' } }); } };
+  const pool = new AccountPool(offline, [account('a')], { 'codex:a': { ...credential('a'), expiresAt: Date.now() - 1 } }, state);
+  assert.deepEqual(await pool.refreshLapsed(), { healed: 0, failed: 0, unreachable: 1 });
+  const a = pool.accounts[0]!;
+  assert.match(a.error!, /unreachable \(ETIMEDOUT\); retrying/);
+  assert.equal(pool.acquire('s'), null, 'an expired token still cannot serve while the network is down');
 });

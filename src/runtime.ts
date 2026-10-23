@@ -5,11 +5,27 @@ import { AccountPool } from './account-pool.js';
 import { createProxy, secureEqual } from './proxy.js';
 import { createServer } from 'node:http';
 import { providers } from './providers.js';
-import { defaultConfig, loadConfig, loadCredentials, loadState, paths, saveCredentials, saveState } from './storage.js';
-import type { PersistedState, ProviderId, TeamAIConfig } from './types.js';
+import { defaultConfig, loadConfig, loadCredentials, loadState, paths, readCredentialsText, saveCredentialsIfUnchanged, saveState } from './storage.js';
+import type { OAuthCredential, PersistedState, ProviderId, TeamAIConfig } from './types.js';
 
 // How long a stopping server waits for in-flight responses before cutting them.
 const DRAIN_MS = 5_000;
+// How long one save may take before the next is allowed to start, and how long
+// a stopping server waits on saves. A save normally takes milliseconds; one
+// stuck behind a saturated thread pool (see threadpool.ts) used to hold every
+// later save, and the shutdown that awaits them, indefinitely (2026-10-22).
+const SAVE_TIMEOUT_MS = 30_000;
+const SHUTDOWN_SAVE_MS = 5_000;
+
+// Wait for work, but no longer than ms. The work keeps running past the
+// deadline; whoever waits simply stops waiting. Failures are logged, not
+// thrown, so one bad save cannot break the chain behind it.
+function bounded(work: Promise<unknown>, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => { console.log(`[TeamAI] save still pending after ${ms}ms; moving on`); resolve(); }, ms); timer.unref();
+    work.catch((error) => console.log(`[TeamAI] save failed: ${(error as Error).message}`)).finally(() => { clearTimeout(timer); resolve(); });
+  });
+}
 
 // Ports this provider should still answer on besides the configured one:
 // whatever the user listed in proxy.legacyPorts, plus the built-in default,
@@ -31,8 +47,23 @@ export async function runServer(): Promise<void> {
   // Every save first adopts any credential the TUI wrote since (a re-login),
   // then writes memory back — so a fresh token is picked up within a save
   // interval instead of being overwritten by the stale one it replaced.
-  const persistNow = async (): Promise<void> => { const updated = await loadCredentials(); const adopted = pools.reduce((n, p) => n + p.adoptCredentials(updated), 0); if (adopted) events.push({ at: Date.now(), message: `Adopted ${adopted} re-logged credential(s)` }); const next: PersistedState = { version: 1, accounts: {}, events }; pools.forEach((p) => p.exportState(next)); for (const p of pools) for (const a of p.accounts) updated[a.credentialId] = a.credential; await Promise.all([saveState(next), saveCredentials(updated)]); };
-  const persist = (event?: string): void => { if (event) { events.push({ at: Date.now(), message: event }); if (events.length > 200) events.splice(0, events.length - 200); } if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = null; saving = saving.then(persistNow, persistNow); }, 25); };
+  // The credentials write is conditional on the file still reading as it did at
+  // the start: a save delayed past a re-login otherwise wrote the token that
+  // re-login replaced back over it (2026-10-22). On a mismatch nothing is
+  // written and the save runs again, adopting the new token first. A save that
+  // outlived its timeout is also superseded by any later one (the generation),
+  // so it can land neither file with what memory held minutes ago.
+  let saveGeneration = 0;
+  const persistNow = async (): Promise<boolean> => {
+    const generation = ++saveGeneration; const current = (): boolean => generation === saveGeneration;
+    const snapshot = await readCredentialsText(); const updated = (snapshot ? JSON.parse(snapshot) : {}) as Record<string, OAuthCredential>;
+    const adopted = pools.reduce((n, p) => n + p.adoptCredentials(updated), 0); if (adopted) events.push({ at: Date.now(), message: `Adopted ${adopted} re-logged credential(s)` });
+    const next: PersistedState = { version: 1, accounts: {}, events }; pools.forEach((p) => p.exportState(next)); for (const p of pools) for (const a of p.accounts) updated[a.credentialId] = a.credential;
+    const [, written] = await Promise.all([saveState(next, async () => current()), saveCredentialsIfUnchanged(updated, snapshot, current)]);
+    if (!written && current()) persist('Credentials changed on disk during a save; saving again');
+    return written;
+  };
+  const persist = (event?: string): void => { if (event) { events.push({ at: Date.now(), message: event }); if (events.length > 200) events.splice(0, events.length - 200); } if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = null; saving = saving.then(() => bounded(persistNow(), SAVE_TIMEOUT_MS)); }, 25); };
   const servers: Server[] = [];
   for (const pool of pools) {
     if (!pool.accounts.length) continue;
@@ -99,7 +130,7 @@ export async function runServer(): Promise<void> {
   // five minutes; the sweep itself is sequential to avoid a token-endpoint burst.
   // The sweep always schedules a save, even with nothing to report, so an idle
   // fleet still adopts a re-login (see persistNow) within five minutes.
-  const refreshLapsed = async (): Promise<void> => { const results = await Promise.all(pools.map((pool) => pool.refreshLapsed())); const healed = results.reduce((a, r) => a + r.healed, 0); const failed = results.reduce((a, r) => a + r.failed, 0); if (healed) persist(`Refreshed ${healed} lapsed token(s)`); if (failed) persist(`${failed} token refresh(es) failed — re-login needed`); if (!healed && !failed) persist(); };
+  const refreshLapsed = async (): Promise<void> => { const results = await Promise.all(pools.map((pool) => pool.refreshLapsed())); const healed = results.reduce((a, r) => a + r.healed, 0); const failed = results.reduce((a, r) => a + r.failed, 0); const unreachable = results.reduce((a, r) => a + r.unreachable, 0); if (healed) persist(`Refreshed ${healed} lapsed token(s)`); if (failed) persist(`${failed} token refresh(es) failed — re-login needed`); if (unreachable) persist(`${unreachable} token refresh(es) could not reach the server — retrying in 5 min`); if (!healed && !failed && !unreachable) persist(); };
   setImmediate(() => void refreshLapsed()); const lapsedTimer = setInterval(() => void refreshLapsed(), 5 * 60_000); lapsedTimer.unref();
   // Local control channel: the TUI runs in a separate process, so a fleet-wide
   // quota re-measure (R) has to reach the pools living here. Bound to the proxy
@@ -140,7 +171,12 @@ export async function runServer(): Promise<void> {
     const drained = Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
     await Promise.race([drained, new Promise<void>((resolve) => setTimeout(resolve, DRAIN_MS).unref())]);
     servers.forEach((server) => server.closeAllConnections());
-    await drained; await saving; await persistNow(); await releaseServerFile(serverPath); process.exit(0);
+    // The last save carries tokens refreshed in memory, which upstream will not
+    // honour twice — so a re-login landing mid-save gets a few more tries here
+    // rather than the deferred retry a running server would make.
+    await drained; await bounded(saving, SHUTDOWN_SAVE_MS);
+    const finalSave = async (): Promise<void> => { for (let attempt = 0; attempt < 3 && !await persistNow(); attempt++); };
+    await bounded(finalSave(), SHUTDOWN_SAVE_MS); await releaseServerFile(serverPath); process.exit(0);
   };
   process.once('SIGINT', shutdown); process.once('SIGTERM', shutdown);
 }
@@ -149,8 +185,9 @@ export async function runServer(): Promise<void> {
 // replacement bind and write its own server.json while this one is still
 // draining; deleting unconditionally erased the live server's record, so every
 // launcher took the relay for stopped and died on EADDRINUSE (2026-10-15).
-async function releaseServerFile(serverPath: string): Promise<void> {
-  try { const value = JSON.parse(await readFile(serverPath, 'utf8')) as { pid?: number }; if (value.pid !== process.pid) return; } catch { return; }
+// `teamai stop` passes the pid it killed: a killed server never gets here.
+export async function releaseServerFile(serverPath: string, pid = process.pid): Promise<void> {
+  try { const value = JSON.parse(await readFile(serverPath, 'utf8')) as { pid?: number }; if (value.pid !== pid) return; } catch { return; }
   await rm(serverPath, { force: true });
 }
 export async function runningPid(): Promise<number | null> { try { const value = JSON.parse(await readFile(paths().server, 'utf8')) as { pid?: number }; if (!value.pid) return null; process.kill(value.pid, 0); return value.pid; } catch { return null; } }

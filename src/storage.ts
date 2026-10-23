@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { codexUserId } from './auth.js';
 import type { OAuthCredential, PersistedState, ProviderId, StoredAccount, TeamAIConfig } from './types.js';
 
@@ -18,19 +18,40 @@ async function readJson<T>(path: string, fallback: T): Promise<T> {
   try { return JSON.parse(await readFile(path, 'utf8')) as T; } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return fallback; throw error; }
 }
 
-async function atomicWrite(path: string, value: unknown): Promise<void> {
+// One temp file per write, not per process: a save that outlives its timeout
+// can still be in flight when the next one starts, and sharing a temp name let
+// the two interleave into one file.
+let tempSeq = 0;
+// commit, when given, is asked right before the rename and can veto it; the
+// temp file is removed and false returned.
+async function atomicWrite(path: string, value: unknown, commit?: () => Promise<boolean>): Promise<boolean> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const temp = `${path}.${process.pid}.tmp`;
-  await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  await rename(temp, path);
+  const temp = `${path}.${process.pid}.${++tempSeq}.tmp`;
+  try {
+    await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    if (commit && !await commit()) return false;
+    await rename(temp, path);
+    return true;
+  } finally { await rm(temp, { force: true }); }
 }
 
 export async function loadConfig(): Promise<TeamAIConfig> { return readJson(paths().config, defaultConfig()); }
 export async function saveConfig(config: TeamAIConfig): Promise<void> { await atomicWrite(paths().config, config); }
 export async function loadCredentials(): Promise<Record<string, OAuthCredential>> { return readJson(paths().credentials, {}); }
 export async function saveCredentials(value: Record<string, OAuthCredential>): Promise<void> { await atomicWrite(paths().credentials, value); }
+// The file exactly as stored, for a writer that must not overwrite what another
+// process (a re-login in the TUI) wrote after it last looked.
+export async function readCredentialsText(): Promise<string> {
+  try { return await readFile(paths().credentials, 'utf8'); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ''; throw error; }
+}
+// Write only if the file still reads as expected; false means it changed since
+// and nothing was written. The check sits after the temp write, so a save
+// delayed for minutes is judged against the file as it is when it lands.
+export async function saveCredentialsIfUnchanged(value: Record<string, OAuthCredential>, expected: string, current: () => boolean = () => true): Promise<boolean> {
+  return atomicWrite(paths().credentials, value, async () => current() && await readCredentialsText() === expected);
+}
 export async function loadState(): Promise<PersistedState> { return readJson(paths().state, { version: 1, accounts: {}, events: [] }); }
-export async function saveState(value: PersistedState): Promise<void> { await atomicWrite(paths().state, value); }
+export async function saveState(value: PersistedState, commit?: () => Promise<boolean>): Promise<boolean> { return atomicWrite(paths().state, value, commit); }
 
 // The key a stored account is known by: the account id, plus the user for a
 // Codex workspace that several members share.

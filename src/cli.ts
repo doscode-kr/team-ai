@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import './threadpool.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { chmod, mkdir, open, readFile, writeFile, lstat, symlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -9,8 +10,8 @@ import { importAuth, loginClaude, loginCodex } from './auth.js';
 import { captureDashboard } from './capture.js';
 import { relayedCodexConfig } from './codex-config.js';
 import { isRedactLevel } from './redact.js';
-import { runServer, runningPid } from './runtime.js';
-import { dataDir, loadConfig, loadState, saveConfig, upsertAccount } from './storage.js';
+import { releaseServerFile, runServer, runningPid } from './runtime.js';
+import { dataDir, loadConfig, loadState, paths, saveConfig, upsertAccount } from './storage.js';
 import { runTui } from './tui.js';
 import type { ProviderId } from './types.js';
 
@@ -69,7 +70,28 @@ async function toggle(enabled: boolean): Promise<void> { const id = provider(arg
 async function priority(): Promise<void> { const id = provider(args[0]); const rankRaw = args.at(-1); const name = args.slice(1, -1).join(' '); const config = await loadConfig(); const account = config.accounts.find((a) => a.provider === id && (a.id === name || a.label === name)); if (!account) throw new Error('Account not found'); if (!rankRaw || (rankRaw !== 'auto' && (!Number.isInteger(Number(rankRaw)) || Number(rankRaw) < 1))) throw new Error('Priority must be a positive integer or auto'); account.priority = rankRaw === 'auto' ? null : Number(rankRaw); await saveConfig(config); console.log(`Priority ${account.priority ?? 'auto'}: ${account.label}`); }
 
 async function status(): Promise<void> { const pid = await runningPid(); console.log(pid ? `TeamAI server running (pid ${pid})` : 'TeamAI server is stopped'); await accounts(); }
-async function stop(quiet = false): Promise<void> { const pid = await runningPid(); if (!pid) { if (!quiet) console.log('TeamAI server is not running'); return; } process.kill(pid, 'SIGTERM'); for (let i = 0; i < 30 && await runningPid(); i++) await new Promise((r) => setTimeout(r, 100)); if (!quiet) console.log(`Stopped TeamAI server ${pid}`); }
+// A clean stop drains for up to 5s and saves for up to 2×5s (runtime.ts). The
+// wait used to be 3s, so restart routinely found the old pid still alive,
+// started nothing, and left a server that had already closed its ports. Past
+// the budget the server is killed: its writes are atomic, so a kill can only
+// drop a save, never tear a file.
+const STOP_WAIT_MS = 20_000;
+async function stop(quiet = false): Promise<void> {
+  const pid = await runningPid(); if (!pid) { if (!quiet) console.log('TeamAI server is not running'); return; }
+  // Wait on this pid, not on whatever server.json names: a supervisor may have
+  // started a replacement meanwhile, and that one is not ours to kill.
+  const alive = (): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  process.kill(pid, 'SIGTERM');
+  for (let waited = 0; waited < STOP_WAIT_MS && alive(); waited += 100) await new Promise((r) => setTimeout(r, 100));
+  if (alive() && await runningPid() === pid) {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* exited on its own just now */ }
+    for (let waited = 0; waited < 2_000 && alive(); waited += 50) await new Promise((r) => setTimeout(r, 50));
+    // A killed server leaves its server.json; clear it so ensureServer starts a new one.
+    await releaseServerFile(paths().server, pid);
+    console.log(`TeamAI server ${pid} did not stop within ${STOP_WAIT_MS / 1000}s; killed`); return;
+  }
+  if (!quiet) console.log(`Stopped TeamAI server ${pid}`);
+}
 
 // Start the relay on demand. This is what makes the launchers work whether or
 // not a LaunchAgent (or any other supervisor) is managing the server: if

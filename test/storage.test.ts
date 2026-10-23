@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, readFile, stat } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -52,5 +52,34 @@ test('does not merge workspace members that share a label because their tokens c
   await storage.upsertAccount('codex', 'workspace', { accessToken: member('user-a'), refreshToken: 'ra', expiresAt: 1, accountId: 'workspace' });
   await storage.upsertAccount('codex', 'workspace', { accessToken: member('user-b'), refreshToken: 'rb', expiresAt: 1, accountId: 'workspace', userId: 'user-b' });
   assert.equal((await storage.loadConfig()).accounts.length, 2);
+  delete process.env.TEAMAI_HOME;
+});
+
+test('a credentials save is dropped when another process wrote the file after it was read', async () => {
+  // The 2026-10-22 failure: a save read the file, stalled for minutes, and
+  // landed after a re-login — writing the token that re-login replaced.
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?test=cas-${Date.now()}`);
+  const stale = { accessToken: 'stale', refreshToken: 'r', expiresAt: 1, accountId: 'a' };
+  await storage.saveCredentials({ 'claude:a': stale });
+  const snapshot = await storage.readCredentialsText();
+  await storage.saveCredentials({ 'claude:a': { ...stale, accessToken: 'relogged', expiresAt: 2 } });
+  assert.equal(await storage.saveCredentialsIfUnchanged({ 'claude:a': stale }, snapshot), false);
+  assert.equal((await storage.loadCredentials())['claude:a'].accessToken, 'relogged', 'the re-login survives');
+  assert.deepEqual((await readdir(root)).filter((f) => f.endsWith('.tmp')), [], 'the vetoed temp file is removed');
+  // Unchanged since the read: the write goes through.
+  assert.equal(await storage.saveCredentialsIfUnchanged({ 'claude:a': stale }, await storage.readCredentialsText()), true);
+  assert.equal((await storage.loadCredentials())['claude:a'].accessToken, 'stale');
+  delete process.env.TEAMAI_HOME;
+});
+
+test('a state save superseded by a later one is not written', async () => {
+  // A save that outlived its timeout must not land older usage over newer.
+  const root = await mkdtemp(join(tmpdir(), 'teamai-storage-')); process.env.TEAMAI_HOME = root;
+  const storage = await import(`../src/storage.js?test=gen-${Date.now()}`);
+  await storage.saveState({ version: 1, accounts: {}, events: [{ at: 2, message: 'newer' }] });
+  assert.equal(await storage.saveState({ version: 1, accounts: {}, events: [{ at: 1, message: 'older' }] }, async () => false), false);
+  assert.equal((await storage.loadState()).events[0].message, 'newer');
+  assert.deepEqual((await readdir(root)).filter((f) => f.endsWith('.tmp')), []);
   delete process.env.TEAMAI_HOME;
 });
